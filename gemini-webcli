@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+
+import argparse, asyncio, inquirer, json, os, pyperclip
+
+import tkinter as tk
+
+from gemini_webapi import GeminiClient, set_log_level
+
+from tkinter import Label
+from PIL import Image, ImageTk
+from prompt_toolkit import PromptSession
+from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.styles import Style
+from rich.console import Console
+from rich.markdown import Markdown
+from typing import Union, Any
+
+session = PromptSession()
+
+bindings = KeyBindings()
+
+
+@bindings.add("c-d")
+def _(event):
+    event.current_buffer.validate_and_handle()
+
+
+async def prompt_with_editing(prefix: str = "") -> str:
+    def continuation(width, line_number, is_soft_wrap):
+        return ""
+
+    return await session.prompt_async(
+        prefix,
+        placeholder=HTML("<u><ansigreen>Enter Ctrl+C to quit.</ansigreen></u>"),
+        multiline=True,
+        key_bindings=bindings,
+        prompt_continuation=continuation,
+        style=Style.from_dict({"prompt": "ansigreen"}),
+    )
+
+
+async def loading_animation():
+    frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    idx = 0
+    try:
+        while True:
+            print(f"\r\033[96m{frames[idx]} Processing...\033[0m", end="", flush=True)
+            idx = (idx + 1) % len(frames)
+            await asyncio.sleep(0.1)
+    except asyncio.CancelledError:
+        print("\r\033[K", end="", flush=True)
+
+
+def _encode_metadata_list(items: list[str]) -> bytes:
+    payload = bytearray(b"gemini-webcli-metadata-v1")
+    payload.append(len(items))
+    for item in items:
+        encoded = item.encode("utf-8")
+        payload.extend(len(encoded).to_bytes(2, "big"))
+        payload.extend(encoded)
+    return bytes(payload)
+
+
+def _decode_metadata_list(raw: bytes) -> list[str] | None:
+    if not raw or not raw.startswith(b"gemini-webcli-metadata-v1"):
+        return None
+
+    try:
+        count = raw[4]
+        pos = 5
+        items: list[str] = []
+        for _ in range(count):
+            if pos + 2 > len(raw):
+                return None
+            length = int.from_bytes(raw[pos : pos + 2], "big")
+            pos += 2
+            if pos + length > len(raw):
+                return None
+            items.append(raw[pos : pos + length].decode("utf-8"))
+            pos += length
+        return items
+    except Exception:
+        return None
+
+
+def show_image(image_path: str) -> None:
+    window = tk.Tk()
+    window.title("Image")
+    img = Image.open(image_path)
+    photo = ImageTk.PhotoImage(img)
+    label = Label(window, image=photo)
+    label.image = photo
+    label.pack()
+    window.mainloop()
+
+
+COOKIE_FILEPATH = "cookie.bin"
+
+
+def save_metadata(metadata: Union[bytes, list[Any]]) -> None:
+    if isinstance(metadata, list) and all(item is None for item in metadata):
+        return
+
+    if isinstance(metadata, bytes):
+        to_write = metadata
+    elif isinstance(metadata, list):
+        to_write = _encode_metadata_list([str(item) for item in metadata])
+    else:
+        raise TypeError("metadata must be bytes or list")
+
+    with open(COOKIE_FILEPATH, "wb") as f:
+        f.write(to_write)
+
+
+def load_metadata() -> Union[bytes, list[Any]] | None:
+    try:
+        with open(COOKIE_FILEPATH, "rb") as f:
+            raw = f.read()
+
+        decoded = _decode_metadata_list(raw)
+        if decoded is not None:
+            return decoded
+
+        try:
+            data = json.loads(raw.decode())
+            if isinstance(data, dict) and data.get("type") == "bytes":
+                return bytes.fromhex(data["data"])
+            if isinstance(data, dict) and data.get("type") == "list":
+                return data.get("data")
+        except Exception:
+            return None
+    except FileNotFoundError:
+        return None
+
+
+console = Console()
+
+
+async def main():
+    parser = argparse.ArgumentParser(description="Gemini Web CLI")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "-e",
+        "--explain",
+        metavar="COMMAND",
+        help="Explain command noninteractively (and copy result to clipboard)",
+    )
+    group.add_argument(
+        "-s",
+        "--suggest",
+        metavar="DESCRIPTION",
+        help="Suggest command noninteractively (and copy result to clipboard)",
+    )
+    args = parser.parse_args()
+
+    command = args.explain if args.explain else None
+    description = args.suggest if args.suggest else None
+
+    set_log_level("CRITICAL")
+
+    client = GeminiClient()
+    await client.init(timeout=180, auto_close=True, close_delay=300, auto_refresh=True)
+
+    if command or description:
+        if command:
+            resp = await client.generate_content(
+                f'Explain the following command with short single line summary (skip the sentence structure; if you cannot be sure, reply "N/A"): {command}'
+            )
+            if resp.text.upper() == "N/A":
+                print("\033[91mN/A\033[0m")
+            else:
+                console.print(Markdown(resp.text))
+        else:
+            resp = await client.generate_content(
+                f'Reply with only the command for the following description, without quotation marks (if you cannot be sure, reply "N/A"): {description}'
+            )
+            if resp.text.upper() == "N/A":
+                print("\033[91mN/A\033[0m")
+            else:
+                print(resp.text)
+        pyperclip.copy(resp.text)
+        return
+
+    previous_session = load_metadata()
+
+    questions = [
+        inquirer.List(
+            "method",
+            message="Choose method:",
+            choices=["send_message()", "generate_content()"],
+            carousel=True,
+        ),
+    ]
+    answers = inquirer.prompt(questions)
+    if answers is None:
+        return
+    method = answers["method"]
+
+    print("\033[96mUse Ctrl+D (EOF) key to send.\n\033[0m")
+
+    PROMPT_PREFIX = "[User]\n"
+    if method != "send_message()":
+        while True:
+            try:
+                query = await prompt_with_editing(PROMPT_PREFIX)
+            except KeyboardInterrupt:
+                return
+
+            if not query.strip():
+                continue
+
+            animation_task = asyncio.create_task(loading_animation())
+            try:
+                resp = await client.generate_content(f"{query}")
+            finally:
+                animation_task.cancel()
+                try:
+                    await animation_task
+                except asyncio.CancelledError:
+                    pass
+
+            for _, image in enumerate(resp.images):
+                await image.save(path="./", filename=f"temp.png", verbose=True)
+                show_image("temp.png")
+
+            os.remove("temp.png")
+            print("")
+    else:
+        chat = client.start_chat(model="gemini-3.0-pro", metadata=previous_session)
+
+        while True:
+            try:
+                query = await prompt_with_editing(PROMPT_PREFIX)
+            except KeyboardInterrupt:
+                break
+
+            if not query.strip():
+                continue
+
+            animation_task = asyncio.create_task(loading_animation())
+            try:
+                resp = await chat.send_message(f"{query}")
+            finally:
+                animation_task.cancel()
+                try:
+                    await animation_task
+                except asyncio.CancelledError:
+                    pass
+
+            print("\n\033[94m[Gemini]\033[0m")
+            console.print(Markdown(f"{resp.text}"))
+            print("")
+
+            save_metadata(chat.metadata)
+
+
+asyncio.run(main())
